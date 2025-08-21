@@ -8,6 +8,7 @@
 import SwiftUI
 import ApplicationServices
 import Carbon
+import UserNotifications
 
 // JSON Response structures
 struct ScoreResponse: Codable {
@@ -35,16 +36,46 @@ struct ImproveData: Codable {
 var globalDetector: AccessibilityTextDetector?
 var statusBarDelegate: StatusBarDelegate?
 
+// Protocol to access app delegate settings
+protocol AppSettingsDelegate: AnyObject {
+    func getUseNotifications() -> Bool
+}
+
+var appSettingsDelegate: AppSettingsDelegate?
+
 protocol StatusBarDelegate: AnyObject {
     func setStatusBarActive(_ active: Bool)
+    func setStatusBarLoading(_ loading: Bool)
 }
+
+// Global state for text replacement feature
+struct EnhancedPromptState {
+    let enhancedPrompt: String
+    let originalText: String
+    let timestamp: Date
+    let sourceApp: String
+    let sourceElement: AXUIElement?
+    
+    var isValid: Bool {
+        // Valid for 5 minutes after analysis
+        Date().timeIntervalSince(timestamp) < 300
+    }
+}
+
+var lastEnhancedPromptState: EnhancedPromptState?
 
 // Beautiful toast notification system
 class SuggestionOverlay {
     static func show(_ text: String, at position: NSPoint) {
+        // Show loading indicator
+        statusBarDelegate?.setStatusBarLoading(true)
+        
         // Send API request and show toast notification
         sendTextToAPI(text) { response in
             DispatchQueue.main.async {
+                // Hide loading indicator
+                statusBarDelegate?.setStatusBarLoading(false)
+                
                 showToastNotification(originalText: text, apiResponse: response, at: position)
             }
         }
@@ -52,6 +83,9 @@ class SuggestionOverlay {
     
     private static func sendTextToAPI(_ text: String, completion: @escaping (String) -> Void) {
         guard let url = URL(string: "http://localhost:4200/score") else {
+            DispatchQueue.main.async {
+                statusBarDelegate?.setStatusBarLoading(false)
+            }
             completion("Error: Invalid API URL")
             return
         }
@@ -86,15 +120,112 @@ class SuggestionOverlay {
             
             task.resume()
         } catch {
+            DispatchQueue.main.async {
+                statusBarDelegate?.setStatusBarLoading(false)
+            }
             completion("Failed to send request")
         }
     }
     
     private static func showToastNotification(originalText: String, apiResponse: String, at position: NSPoint) {
-        // Parse JSON and show formatted alert
+        // Check user preference for display mode
+        let useNotifications = appSettingsDelegate?.getUseNotifications() ?? true
+        
+        if useNotifications {
+            showAsNotification(originalText: originalText, apiResponse: apiResponse)
+        } else {
+            showAsAlert(originalText: originalText, apiResponse: apiResponse)
+        }
+    }
+    
+    private static func showAsNotification(originalText: String, apiResponse: String) {
+        // Parse JSON and prepare notification
         var scoreData: ScoreResponse?
         if let data = apiResponse.data(using: .utf8) {
             scoreData = try? JSONDecoder().decode(ScoreResponse.self, from: data)
+        }
+        
+        // Store enhanced prompt globally for replacement feature
+        if let scores = scoreData {
+            storeEnhancedPromptState(originalText: originalText, enhancedPrompt: scores.improve.prompt)
+        }
+        
+        let content = UNMutableNotificationContent()
+        content.categoryIdentifier = "PROMPT_ANALYSIS"
+        content.sound = .default
+        
+        if let scores = scoreData {
+            // Format the score data nicely for notification
+            let overallScore = scores.score.overall
+            let icon = getScoreIcon(for: overallScore)
+            let key_issues = scores.score.key_issues
+            
+            content.title = "\(icon) Prompt Quality Score: \(overallScore)/100"
+            
+            var body = "📊 Scores: Specificity \(scores.score.specificity) • Context \(scores.score.context) • Clarity \(scores.score.clarity) • Structure \(scores.score.structure)"
+            
+            if scores.improve.improvement > 0 {
+                body += "\n🚀 Improvement: +\(scores.improve.improvement) points"
+            }
+            
+            // Add key issues (truncate if too long)
+            if !key_issues.isEmpty {
+                body += "\n🔍 Key Issues: \(key_issues.prefix(2).joined(separator: ", "))"
+                if key_issues.count > 2 {
+                    body += "..."
+                }
+            }
+            
+            body += "\n✨ Enhanced prompt available"
+            content.body = body
+            
+            // Store data for actions
+            content.userInfo = [
+                "originalText": originalText,
+                "enhancedPrompt": scores.improve.prompt,
+                "hasScores": true
+            ]
+        } else {
+            content.title = "⚡ Promptly Analysis"
+            content.body = String(apiResponse.prefix(200)) + (apiResponse.count > 200 ? "..." : "")
+            content.userInfo = [
+                "originalText": originalText,
+                "enhancedPrompt": "",
+                "hasScores": false
+            ]
+        }
+        
+        // Create and deliver notification
+        let request = UNNotificationRequest(
+            identifier: "promptly-analysis-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("Error delivering notification: \(error)")
+                // Fallback to simple alert if notification fails
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = content.title
+                    alert.informativeText = content.body
+                    alert.runModal()
+                }
+            }
+        }
+    }
+    
+    private static func showAsAlert(originalText: String, apiResponse: String) {
+        // Parse JSON and show formatted alert (traditional popup mode)
+        var scoreData: ScoreResponse?
+        if let data = apiResponse.data(using: .utf8) {
+            scoreData = try? JSONDecoder().decode(ScoreResponse.self, from: data)
+        }
+        
+        // Store enhanced prompt globally for replacement feature
+        if let scores = scoreData {
+            storeEnhancedPromptState(originalText: originalText, enhancedPrompt: scores.improve.prompt)
         }
         
         let alert = NSAlert()
@@ -207,10 +338,26 @@ class SuggestionOverlay {
             return "❌"
         }
     }
+    
+    private static func storeEnhancedPromptState(originalText: String, enhancedPrompt: String) {
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        let sourceApp = frontmostApp?.localizedName ?? "Unknown App"
+        
+        lastEnhancedPromptState = EnhancedPromptState(
+            enhancedPrompt: enhancedPrompt,
+            originalText: originalText,
+            timestamp: Date(),
+            sourceApp: sourceApp,
+            sourceElement: nil // TODO: Store focused element for precise replacement
+        )
+        
+        print("Enhanced prompt stored for replacement. App: \(sourceApp)")
+    }
 }
 
 class AccessibilityTextDetector {
-    private var hotKeyRef: EventHotKeyRef?
+    private var analyzeHotKeyRef: EventHotKeyRef?
+    private var replaceHotKeyRef: EventHotKeyRef?
     
     init() {
         globalDetector = self
@@ -240,16 +387,23 @@ class AccessibilityTextDetector {
     }
     
     private func registerHotKey() {
-        // Define the hotkey: Cmd+/
-        let hotKeyID = EventHotKeyID(signature: FourCharCode(0x68746b31), id: 1)
-        
-        // Install event handler
+        // Install event handler for both hotkeys
         var eventType = EventTypeSpec()
         eventType.eventClass = OSType(kEventClassKeyboard)
         eventType.eventKind = OSType(kEventHotKeyPressed)
         
         let callback: EventHandlerUPP = { (nextHandler, theEvent, userData) -> OSStatus in
-            globalDetector?.detectTextFromFrontmostApp()
+            var hotKeyID = EventHotKeyID(signature: 0, id: 0)
+            GetEventParameter(theEvent, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+            
+            if hotKeyID.id == 1 {
+                // Cmd+/ - Analyze text
+                globalDetector?.detectTextFromFrontmostApp()
+            } else if hotKeyID.id == 2 {
+                // Cmd+. - Replace with enhanced prompt
+                globalDetector?.replaceWithEnhancedPrompt()
+            }
+            
             return noErr
         }
         
@@ -257,15 +411,28 @@ class AccessibilityTextDetector {
         let status = InstallEventHandler(GetApplicationEventTarget(), callback, 1, &eventType, nil, &eventHandler)
         
         if status == noErr {
-            // Register the hotkey: Cmd+/ (key code 44)
-            var hotKeyRef: EventHotKeyRef?
-            let result = RegisterEventHotKey(44, UInt32(cmdKey), hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+            // Register Cmd+/ (key code 44) for analysis
+            let analyzeHotKeyID = EventHotKeyID(signature: FourCharCode(0x68746b31), id: 1)
+            var analyzeHotKeyRef: EventHotKeyRef?
+            let analyzeResult = RegisterEventHotKey(44, UInt32(cmdKey), analyzeHotKeyID, GetApplicationEventTarget(), 0, &analyzeHotKeyRef)
             
-            if result == noErr {
-                self.hotKeyRef = hotKeyRef
+            if analyzeResult == noErr {
+                self.analyzeHotKeyRef = analyzeHotKeyRef
                 print("Global hotkey Cmd+/ registered successfully!")
             } else {
-                print("Failed to register hotkey: \(result)")
+                print("Failed to register Cmd+/ hotkey: \(analyzeResult)")
+            }
+            
+            // Register Cmd+. (key code 47) for replacement
+            let replaceHotKeyID = EventHotKeyID(signature: FourCharCode(0x68746b32), id: 2)
+            var replaceHotKeyRef: EventHotKeyRef?
+            let replaceResult = RegisterEventHotKey(47, UInt32(cmdKey), replaceHotKeyID, GetApplicationEventTarget(), 0, &replaceHotKeyRef)
+            
+            if replaceResult == noErr {
+                self.replaceHotKeyRef = replaceHotKeyRef
+                print("Global hotkey Cmd+. registered successfully!")
+            } else {
+                print("Failed to register Cmd+. hotkey: \(replaceResult)")
             }
         } else {
             print("Failed to install event handler: \(status)")
@@ -273,16 +440,69 @@ class AccessibilityTextDetector {
     }
     
     private func unregisterHotKey() {
-        if let hotKeyRef = self.hotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
-            self.hotKeyRef = nil
-            print("Hotkey unregistered")
+        if let analyzeHotKeyRef = self.analyzeHotKeyRef {
+            UnregisterEventHotKey(analyzeHotKeyRef)
+            self.analyzeHotKeyRef = nil
         }
+        
+        if let replaceHotKeyRef = self.replaceHotKeyRef {
+            UnregisterEventHotKey(replaceHotKeyRef)
+            self.replaceHotKeyRef = nil
+        }
+        
+        print("Hotkeys unregistered")
     }
     
     private func showPopupNearCursor(with text: String) {
         let mouseLocation = NSEvent.mouseLocation
         SuggestionOverlay.show(text, at: mouseLocation)
+    }
+    
+    private func showReplacementFeedback(with message: String) {
+        // Check user preference for display mode
+        let useNotifications = appSettingsDelegate?.getUseNotifications() ?? true
+        
+        if useNotifications {
+            showReplacementAsNotification(message: message)
+        } else {
+            showReplacementAsAlert(message: message)
+        }
+    }
+    
+    private func showReplacementAsNotification(message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "✨ Promptly"
+        content.body = message
+        content.sound = .default
+        
+        // Create and deliver notification
+        let request = UNNotificationRequest(
+            identifier: "promptly-replacement-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("Error delivering replacement notification: \(error)")
+                // Fallback to simple alert if notification fails
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "✨ Promptly"
+                    alert.informativeText = message
+                    alert.runModal()
+                }
+            }
+        }
+    }
+    
+    private func showReplacementAsAlert(message: String) {
+        let alert = NSAlert()
+        alert.messageText = "✨ Promptly"
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
     
     private func detectTextFromFrontmostApp() {
@@ -294,7 +514,7 @@ class AccessibilityTextDetector {
         DispatchQueue.global(qos: .userInitiated).async {
             self.performTextDetection()
             
-            // Reset status bar after detection
+            // Reset status bar after detection (only if no API call will follow)
             DispatchQueue.main.async {
                 statusBarDelegate?.setStatusBarActive(false)
             }
@@ -326,70 +546,112 @@ class AccessibilityTextDetector {
                     if !extractedText.isEmpty {
                         self.showPopupNearCursor(with: extractedText)
                     } else {
-                        self.showPopupNearCursor(with: "No accessible text found in focused element")
+                        self.showPopupNearCursor(with: "💡 No text selected. Please select some text and try again.\n\nTip: Highlight text in any app, then press Cmd+/ to analyze it with Promptly.")
                     }
                 }
             } else {
-                let allText = self.extractAllTextFromApp(appRef)
-                
                 DispatchQueue.main.async {
-                    if !allText.isEmpty {
-                        self.showPopupNearCursor(with: allText)
-                    } else {
-                        self.showPopupNearCursor(with: "No accessible text found in \(appName)")
-                    }
+                    self.showPopupNearCursor(with: "💡 Please select some text first.\n\nHighlight the text you want to analyze in \(appName), then press Cmd+/ to get AI-powered prompt suggestions.")
                 }
+            }
+        } else {
+            DispatchQueue.main.async {
+                self.showPopupNearCursor(with: "💡 Please select some text first.\n\nHighlight the text you want to analyze in any app, then press Cmd+/ to get AI-powered prompt suggestions.")
             }
         }
     }
     
     private func extractTextFromElement(_ element: AXUIElement) -> String {
-        var texts: [String] = []
-        
-        if let value = getStringValue(element, attribute: kAXValueAttribute as CFString) {
-            texts.append(value)
-        }
-        
-        if let title = getStringValue(element, attribute: kAXTitleAttribute as CFString) {
-            texts.append(title)
-        }
-        
-        if let description = getStringValue(element, attribute: kAXDescriptionAttribute as CFString) {
-            texts.append(description)
-        }
-        
+        // First priority: Check for selected text
         if let selectedText = getStringValue(element, attribute: kAXSelectedTextAttribute as CFString) {
-            texts.append("Selected: \(selectedText)")
+            return selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         
-        return texts.filter { !$0.isEmpty }.joined(separator: "\n")
-    }
-    
-    private func extractAllTextFromApp(_ appElement: AXUIElement) -> String {
-        var allTexts: Set<String> = []
-        traverseUIElements(appElement, texts: &allTexts, depth: 0, maxDepth: 5)
-        return allTexts.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                      .joined(separator: "\n")
-    }
-    
-    private func traverseUIElements(_ element: AXUIElement, texts: inout Set<String>, depth: Int, maxDepth: Int) {
-        guard depth < maxDepth else { return }
-        
+        // Second priority: Get content of text field/area where cursor is positioned
         if let value = getStringValue(element, attribute: kAXValueAttribute as CFString) {
-            texts.insert(value)
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         
-        if let title = getStringValue(element, attribute: kAXTitleAttribute as CFString) {
-            texts.insert(title)
+        // No relevant text found
+        return ""
+    }
+    
+    func replaceWithEnhancedPrompt() {
+        // Check if we have a valid enhanced prompt to replace with
+        guard let state = lastEnhancedPromptState, state.isValid else {
+            DispatchQueue.main.async {
+                self.showReplacementFeedback(with: "💡 No recent enhanced prompt available.\n\nFirst analyze some text with Cmd+/, then use Cmd+. to replace it within 5 minutes.")
+            }
+            return
         }
         
-        var children: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
-           let childArray = children as? [AXUIElement] {
-            for child in childArray.prefix(20) {
-                traverseUIElements(child, texts: &texts, depth: depth + 1, maxDepth: maxDepth)
+        // Notify status bar that replacement is active
+        DispatchQueue.main.async {
+            statusBarDelegate?.setStatusBarActive(true)
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.performTextReplacement(with: state)
+            
+            // Reset status bar after replacement
+            DispatchQueue.main.async {
+                statusBarDelegate?.setStatusBarActive(false)
             }
         }
+    }
+    
+    private func performTextReplacement(with state: EnhancedPromptState) {
+        guard AXIsProcessTrusted() else {
+            DispatchQueue.main.async {
+                self.showReplacementFeedback(with: "Error: Accessibility permissions required for text replacement.")
+            }
+            return
+        }
+        
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        let appName = frontmostApp?.localizedName ?? "Unknown App"
+        
+        if let pid = frontmostApp?.processIdentifier {
+            let appRef = AXUIElementCreateApplication(pid)
+            var focusedElement: CFTypeRef?
+            
+            if AXUIElementCopyAttributeValue(appRef, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success,
+               let element = focusedElement {
+                
+                let axElement = element as! AXUIElement
+                let success = replaceTextInElement(axElement, with: state.enhancedPrompt)
+                
+                DispatchQueue.main.async {
+                    if success {
+                        // Clear the stored state after successful replacement
+                        lastEnhancedPromptState = nil
+                        self.showReplacementFeedback(with: "✅ Text replaced with enhanced prompt!")
+                    } else {
+                        // Fallback: Copy to clipboard
+                        let pasteboard = NSPasteboard.general
+                        pasteboard.clearContents()
+                        pasteboard.setString(state.enhancedPrompt, forType: .string)
+                        self.showReplacementFeedback(with: "📋 Enhanced prompt copied to clipboard.\n\nCouldn't replace text automatically, but it's ready to paste!")
+                    }
+                }
+            } else {
+                DispatchQueue.main.async {
+                    // Fallback: Copy to clipboard
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(state.enhancedPrompt, forType: .string)
+                    self.showReplacementFeedback(with: "📋 Enhanced prompt copied to clipboard.\n\nNo focused text field found in \(appName), but it's ready to paste!")
+                }
+            }
+        }
+    }
+    
+    private func replaceTextInElement(_ element: AXUIElement, with newText: String) -> Bool {
+        // Try to set the value directly - this works for most text fields
+        let newValue = newText as CFString
+        let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newValue)
+        
+        return result == .success
     }
     
     private func getStringValue(_ element: AXUIElement, attribute: CFString) -> String? {
