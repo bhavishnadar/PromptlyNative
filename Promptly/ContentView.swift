@@ -27,9 +27,9 @@ struct ScoreData: Codable {
 
 struct ImproveData: Codable {
     let prompt: String
-    let original_score: Int
-    let improved_score: Int
-    let improvement: Int
+    let original_score: Int?
+    let improved_score: Int?
+    let improvement: Int?
 }
 
 // Global reference for Carbon hotkey callback
@@ -82,7 +82,7 @@ class SuggestionOverlay {
     }
     
     private static func sendTextToAPI(_ text: String, completion: @escaping (String) -> Void) {
-        guard let url = URL(string: "http://localhost:4200/score") else {
+        guard let url = URL(string: "https://promptly-backend-wwdj.onrender.com/score") else {
             DispatchQueue.main.async {
                 statusBarDelegate?.setStatusBarLoading(false)
             }
@@ -164,8 +164,8 @@ class SuggestionOverlay {
             
             var body = "📊 Scores: Specificity \(scores.score.specificity) • Context \(scores.score.context) • Clarity \(scores.score.clarity) • Structure \(scores.score.structure)"
             
-            if scores.improve.improvement > 0 {
-                body += "\n🚀 Improvement: +\(scores.improve.improvement) points"
+            if let improvement = scores.improve.improvement, improvement > 0 {
+                body += "\n🚀 Improvement: +\(improvement) points"
             }
             
             // Add key issues (truncate if too long)
@@ -176,14 +176,20 @@ class SuggestionOverlay {
                 }
             }
             
-            body += "\n✨ Enhanced prompt available"
+            // Different message based on whether improvement metrics are available
+            if scores.improve.improvement != nil {
+                body += "\n✨ Enhanced prompt available"
+            } else {
+                body += "\n💡 Feedback available"
+            }
             content.body = body
             
             // Store data for actions
             content.userInfo = [
                 "originalText": originalText,
                 "enhancedPrompt": scores.improve.prompt,
-                "hasScores": true
+                "hasScores": true,
+                "isEnhancement": scores.improve.improvement != nil
             ]
         } else {
             content.title = "⚡ Promptly Analysis"
@@ -245,8 +251,11 @@ class SuggestionOverlay {
             details += "   • Clarity: \(scores.score.clarity)\n"
             details += "   • Structure: \(scores.score.structure)\n"
             
-            if scores.improve.improvement > 0 {
-                details += "\n🚀 Improvement: +\(scores.improve.improvement) points (\(scores.improve.original_score) → \(scores.improve.improved_score))"
+            if let improvement = scores.improve.improvement, 
+               let originalScore = scores.improve.original_score,
+               let improvedScore = scores.improve.improved_score,
+               improvement > 0 {
+                details += "\n🚀 Improvement: +\(improvement) points (\(originalScore) → \(improvedScore))"
             }
             
             // Add key issues
@@ -257,8 +266,12 @@ class SuggestionOverlay {
                 }
             }
             
-            // Mention enhanced prompt availability
-            details += "\n\n✨ Enhanced prompt available"
+            // Different message based on whether improvement metrics are available
+            if scores.improve.improvement != nil {
+                details += "\n\n✨ Enhanced prompt available"
+            } else {
+                details += "\n\n💡 Feedback available"
+            }
             
             alert.informativeText = details
         } else {
@@ -267,28 +280,44 @@ class SuggestionOverlay {
         }
         
         if let scores = scoreData {
-            alert.addButton(withTitle: "Copy Enhanced Prompt")
-            alert.addButton(withTitle: "Copy Original Text")
-            alert.addButton(withTitle: "Show Enhanced Prompt")
+            // Different button labels based on whether it's an enhancement or feedback
+            if scores.improve.improvement != nil {
+                alert.addButton(withTitle: "Copy Enhanced Prompt")
+                alert.addButton(withTitle: "Copy Original Text")
+                alert.addButton(withTitle: "Show Enhanced Prompt")
+            } else {
+                alert.addButton(withTitle: "Copy Feedback")
+                alert.addButton(withTitle: "Show Feedback")
+            }
             alert.addButton(withTitle: "Close")
             
             let response = alert.runModal()
             
+            let isEnhancement = scores.improve.improvement != nil
+            
             if response == .alertFirstButtonReturn {
-                // Copy Enhanced Prompt
+                // Copy Enhanced Prompt or Feedback
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()
                 pasteboard.setString(scores.improve.prompt, forType: .string)
                 
             } else if response == .alertSecondButtonReturn {
-                // Copy Original Text
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.setString(originalText, forType: .string)
+                if isEnhancement {
+                    // Copy Original Text (only for enhancements)
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(originalText, forType: .string)
+                } else {
+                    // Show Feedback (for low-score responses)
+                    showEnhancedPromptDetail(enhanced_prompt: scores.improve.prompt, originalText: originalText, isEnhancement: isEnhancement)
+                }
                 
             } else if response == .alertThirdButtonReturn {
-                // Show Enhanced Prompt in detail
-                showEnhancedPromptDetail(enhanced_prompt: scores.improve.prompt, originalText: originalText)
+                if isEnhancement {
+                    // Show Enhanced Prompt in detail
+                    showEnhancedPromptDetail(enhanced_prompt: scores.improve.prompt, originalText: originalText, isEnhancement: isEnhancement)
+                }
+                // For low-score responses, third button is "Close" - no action needed
             }
         } else {
             alert.addButton(withTitle: "Copy Original Text")
@@ -303,29 +332,34 @@ class SuggestionOverlay {
         }
     }
     
-    private static func showEnhancedPromptDetail(enhanced_prompt: String, originalText: String) {
+    private static func showEnhancedPromptDetail(enhanced_prompt: String, originalText: String, isEnhancement: Bool = true) {
         let detailAlert = NSAlert()
-        detailAlert.messageText = "✨ Enhanced Prompt"
+        detailAlert.messageText = isEnhancement ? "✨ Enhanced Prompt" : "💡 AI Feedback"
         detailAlert.informativeText = enhanced_prompt
         detailAlert.alertStyle = .informational
         
-        detailAlert.addButton(withTitle: "Copy Enhanced Prompt")
-        detailAlert.addButton(withTitle: "Copy Original Text") 
+        detailAlert.addButton(withTitle: isEnhancement ? "Copy Enhanced Prompt" : "Copy Feedback")
+        if isEnhancement {
+            detailAlert.addButton(withTitle: "Copy Original Text")
+        }
         detailAlert.addButton(withTitle: "Close")
         
         let response = detailAlert.runModal()
         
         if response == .alertFirstButtonReturn {
-            // Copy Enhanced Prompt
+            // Copy Enhanced Prompt or Feedback
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(enhanced_prompt, forType: .string)
             
         } else if response == .alertSecondButtonReturn {
-            // Copy Original Text
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(originalText, forType: .string)
+            if isEnhancement {
+                // Copy Original Text (only available for enhancements)
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(originalText, forType: .string)
+            }
+            // For low-score responses, second button is "Close" - no action needed
         }
     }
     
@@ -647,7 +681,53 @@ class AccessibilityTextDetector {
     }
     
     private func replaceTextInElement(_ element: AXUIElement, with newText: String) -> Bool {
-        // Try to set the value directly - this works for most text fields
+        // First, check if there's selected text - if so, replace only the selection
+        if let selectedText = getStringValue(element, attribute: kAXSelectedTextAttribute as CFString),
+           !selectedText.isEmpty {
+            // Try to replace selected text by setting the selected text attribute
+            let newValue = newText as CFString
+            let result = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, newValue)
+            
+            if result == .success {
+                return true
+            }
+            
+            // Fallback: Get current text, replace the selection manually, then set the whole value
+            if let currentText = getStringValue(element, attribute: kAXValueAttribute as CFString) {
+                // Get selection range to manually replace
+                var selectionRange: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selectionRange) == .success,
+                   let range = selectionRange {
+                    
+                    // Extract range values
+                    let rangeValue = range as! AXValue
+                    var cfRange = CFRange()
+                    if AXValueGetValue(rangeValue, AXValueType.cfRange, &cfRange) {
+                            // Ensure the range is within bounds
+                            let textLength = currentText.count
+                            let location = max(0, min(cfRange.location, textLength))
+                            let length = max(0, min(cfRange.length, textLength - location))
+                            
+                            if location >= 0 && location < textLength && length > 0 {
+                                // Use NSString for safer index calculation
+                                let nsString = currentText as NSString
+                                let range = NSRange(location: location, length: length)
+                                
+                                // Replace the selected portion with the new text
+                                let modifiedText = nsString.replacingCharacters(in: range, with: newText)
+                                
+                                // Set the modified text
+                                let modifiedValue = modifiedText as CFString
+                                let setResult = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, modifiedValue)
+                                return setResult == .success
+                            }
+                    }
+                }
+            }
+        }
+        
+        // Fallback: If no selection or selection replacement failed, replace entire content
+        // This maintains the current behavior as a last resort
         let newValue = newText as CFString
         let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newValue)
         

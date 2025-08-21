@@ -326,6 +326,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, StatusBarDelegate, UNUserNot
         let userInfo = response.notification.request.content.userInfo
         let originalText = userInfo["originalText"] as? String ?? ""
         let enhancedPrompt = userInfo["enhancedPrompt"] as? String ?? ""
+        let isEnhancement = userInfo["isEnhancement"] as? Bool ?? true
         
         switch response.actionIdentifier {
         case "COPY_ENHANCED_PROMPT":
@@ -345,11 +346,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, StatusBarDelegate, UNUserNot
         case "VIEW_DETAILS":
             await MainActor.run {
                 let alert = NSAlert()
-                alert.messageText = "✨ Enhanced Prompt"
+                alert.messageText = isEnhancement ? "✨ Enhanced Prompt" : "💡 AI Feedback"
                 alert.informativeText = enhancedPrompt
                 alert.alertStyle = .informational
-                alert.addButton(withTitle: "Copy Enhanced Prompt")
-                alert.addButton(withTitle: "Copy Original Text")
+                alert.addButton(withTitle: isEnhancement ? "Copy Enhanced Prompt" : "Copy Feedback")
+                if isEnhancement {
+                    alert.addButton(withTitle: "Copy Original Text")
+                }
                 alert.addButton(withTitle: "Close")
                 
                 let response = alert.runModal()
@@ -358,9 +361,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, StatusBarDelegate, UNUserNot
                     pasteboard.clearContents()
                     pasteboard.setString(enhancedPrompt, forType: .string)
                 } else if response == .alertSecondButtonReturn {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(originalText, forType: .string)
+                    if isEnhancement {
+                        // Copy Original Text (only available for enhancements)
+                        let pasteboard = NSPasteboard.general
+                        pasteboard.clearContents()
+                        pasteboard.setString(originalText, forType: .string)
+                    }
+                    // For low-score responses, second button is "Close" - no action needed
                 }
             }
             
